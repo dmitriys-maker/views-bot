@@ -62,14 +62,31 @@ def get_sheet():
 def save_to_sheet(editor_name, channel, tg_id, platform, videos):
     sh, ws, ws_sum = get_sheet()
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    total_views = sum(v["views"] for v in videos)
+
+    existing = ws.get_all_values()
+    existing_keys = set()
+    for row in existing[1:]:
+        if len(row) >= 8:
+            key = (row[1], row[2], str(row[5]), row[7].strip().lower()[:50])
+            existing_keys.add(key)
 
     rows_to_add = []
+    skipped = []
     for v in videos:
-        rows_to_add.append([now, editor_name, channel, str(tg_id), platform, v["views"], len(videos), v.get("description", "")])
-    ws.append_rows(rows_to_add)
-    update_summary(ws_sum, editor_name, channel, total_views, len(videos), 1, now)
-    return total_views
+        desc = v.get("description", "")
+        key = (editor_name, channel, str(v["views"]), desc.strip().lower()[:50])
+        if key in existing_keys:
+            skipped.append(v)
+        else:
+            rows_to_add.append([now, editor_name, channel, str(tg_id), platform, v["views"], len(videos), desc])
+            existing_keys.add(key)
+
+    total_views = sum(r[5] for r in rows_to_add)
+    if rows_to_add:
+        ws.append_rows(rows_to_add)
+        update_summary(ws_sum, editor_name, channel, total_views, len(rows_to_add), 1, now)
+
+    return total_views, skipped
 
 
 def update_summary(ws_sum, editor_name, channel, new_views, new_vids, new_screens, now):
