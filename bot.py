@@ -162,25 +162,29 @@ async def process_queue(user_id, editor_name, ctx):
             videos = await scan_image(bytes(image_bytes), item["mime"])
 
             if not videos:
-                await ctx.bot.send_message(user_id, "⚠️ Один скрин пропущен — не нашёл просмотры.")
+                await ctx.bot.send_message(user_id, "Один скрин пропущен — не нашёл просмотры.")
                 continue
 
-            total = save_to_sheet(editor_name, state["channel"], user_id, state["platform"], videos)
-            state["session_views"] += total
-            state["session_videos"] += len(videos)
+            total_views, skipped = save_to_sheet(editor_name, state["channel"], user_id, state["platform"], videos)
+            state["session_views"] += total_views
+            state["session_videos"] += len(videos) - len(skipped)
             state["session_screens"] += 1
 
             remaining = len(state["queue"])
-            lines = [f"✓ Скрин обработан ({state['platform']}, канал: {state['channel']})"]
+            lines = [f"Скрин обработан ({state['platform']}, канал: {state['channel']})"]
             for v in videos:
                 desc = f" — {v['description']}" if v.get("description") else ""
-                lines.append(f"  · {fmt(v['views'])} просмотров{desc}")
+                is_dup = any(s["views"] == v["views"] and s.get("description", "") == v.get("description", "") for s in skipped)
+                dup_mark = " (дубль, пропущен)" if is_dup else ""
+                lines.append(f"  · {fmt(v['views'])} просмотров{desc}{dup_mark}")
+            if skipped:
+                lines.append(f"Пропущено дублей: {len(skipped)}")
             if remaining > 0:
                 lines.append(f"Осталось: {remaining} скринов")
             await ctx.bot.send_message(user_id, "\n".join(lines))
 
         except Exception as e:
-            await ctx.bot.send_message(user_id, f"⚠️ Ошибка: {e}")
+            await ctx.bot.send_message(user_id, f"Ошибка: {e}")
 
         await asyncio.sleep(0.5)
 
@@ -192,7 +196,7 @@ async def process_queue(user_id, editor_name, ctx):
             f"Скринов: {state['session_screens']}\n"
             f"Роликов: {state['session_videos']}\n"
             f"Просмотров: {fmt(state['session_views'])}\n\n"
-            f"Всё записано в таблицу ✓\n"
+            f"Всё записано в таблицу\n"
             f"Для новой сессии выбери платформу: /tiktok /youtube /vk"
         )
         state["session_views"] = 0
@@ -243,7 +247,7 @@ async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["channel"] = channel
         state["platform"] = state["pending_platform"]
         state["waiting_channel"] = False
-        await update.message.reply_text(f"Канал: {channel}\nПлатформа: {state['platform']} ✓\n\nТеперь кидай скрины!")
+        await update.message.reply_text(f"Канал: {channel}\nПлатформа: {state['platform']}\n\nТеперь кидай скрины!")
     else:
         await update.message.reply_text("Выбери платформу:\n/tiktok /youtube /vk")
 
