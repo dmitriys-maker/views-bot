@@ -3,8 +3,7 @@ import json
 import asyncio
 import base64
 import httpx
-import tempfile
-from datetime import datetime, date
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -33,24 +32,18 @@ MONTHS_RU = {
 }
 
 
-def get_billing_month(dt=None):
-    """Возвращает (год, месяц) расчётного периода для даты.
-    Период: с 4-го числа текущего месяца по 3-е следующего.
-    Если день < 4 — относится к предыдущему месяцу."""
+def get_billing_period(dt=None):
+    """
+    Определяет расчётный период по дате отправки скрина.
+    1-16 число → первая половина (период 1) текущего месяца
+    17-31 число → вторая половина (период 2) текущего месяца
+    Возвращает строку вида "Апрель 1 2026" или "Апрель 2 2026"
+    """
     if dt is None:
         dt = datetime.now()
-    if dt.day <= 4:
-        # Относится к предыдущему месяцу
-        if dt.month == 1:
-            return dt.year - 1, 12
-        else:
-            return dt.year, dt.month - 1
-    else:
-        return dt.year, dt.month
-
-
-def billing_month_label(year, month):
-    return f"{MONTHS_RU[month]} {year}"
+    month_name = MONTHS_RU[dt.month]
+    half = 1 if dt.day <= 16 else 2
+    return f"{month_name} {half} {dt.year}"
 
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
@@ -89,8 +82,7 @@ def save_to_sheet(editor_name, channel, tg_id, platform, videos):
     sh, ws, ws_sum = get_sheet()
     now = datetime.now()
     now_str = now.strftime("%d.%m.%Y %H:%M")
-    year, month = get_billing_month(now)
-    period = billing_month_label(year, month)
+    period = get_billing_period(now)
 
     existing = ws.get_all_values()
     existing_keys = set()
@@ -161,7 +153,12 @@ async def scan_image(image_bytes, mime_type="image/jpeg"):
 
 def get_state(user_id):
     if user_id not in user_states:
-        user_states[user_id] = {"platform": None, "channel": None, "waiting_channel": False, "pending_platform": None, "queue": [], "processing": False, "session_views": 0, "session_videos": 0, "session_screens": 0}
+        user_states[user_id] = {
+            "platform": None, "channel": None,
+            "waiting_channel": False, "pending_platform": None,
+            "queue": [], "processing": False,
+            "session_views": 0, "session_videos": 0, "session_screens": 0
+        }
     return user_states[user_id]
 
 
@@ -212,8 +209,7 @@ async def process_queue(user_id, editor_name, ctx):
         await asyncio.sleep(0.5)
 
     if state["session_screens"] > 0:
-        year, month = get_billing_month()
-        period = billing_month_label(year, month)
+        period = get_billing_period()
         await ctx.bot.send_message(user_id,
             f"Готово! Итог сессии:\n"
             f"Период: {period}\n"
@@ -275,8 +271,7 @@ async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["channel"] = channel
         state["platform"] = state["pending_platform"]
         state["waiting_channel"] = False
-        year, month = get_billing_month()
-        period = billing_month_label(year, month)
+        period = get_billing_period()
         await update.message.reply_text(
             f"Канал: {channel}\n"
             f"Платформа: {state['platform']}\n"
@@ -294,14 +289,12 @@ async def photo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state["waiting_channel"]:
         await update.message.reply_text("Сначала введи название канала текстом.")
         return
-
     if not state["platform"] or not state["channel"]:
         await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk /instagram")
         return
 
     photo = update.message.photo[-1]
     state["queue"].append({"file_id": photo.file_id, "mime": "image/jpeg"})
-
     if len(state["queue"]) == 1 and not state["processing"]:
         await update.message.reply_text(f"Получил! Платформа: {state['platform']}, канал: {state['channel']}\nКидай остальные скрины!")
 
@@ -339,20 +332,16 @@ async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = ws_sum.get_all_values()
         rows = [r for r in data[1:] if len(r) > 1 and r[1] == editor_name]
         if rows:
-            # Группируем по периоду
             periods = {}
             for r in rows:
                 period = r[0]
                 views = int(r[3]) if r[3] else 0
-                if period not in periods:
-                    periods[period] = 0
-                periods[period] += views
+                periods[period] = periods.get(period, 0) + views
 
             lines = [f"Твоя статистика ({editor_name}):\n"]
             for period, views in sorted(periods.items()):
                 lines.append(f"• {period}: {fmt(views)} просмотров")
-            total = sum(periods.values())
-            lines.append(f"\nВсего за всё время: {fmt(total)} просмотров")
+            lines.append(f"\nВсего: {fmt(sum(periods.values()))} просмотров")
             await update.message.reply_text("\n".join(lines))
         else:
             await update.message.reply_text("У тебя пока нет записей.")
@@ -372,7 +361,7 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Данных пока нет.")
             return
 
-        # Группируем по периоду
+        # Группируем: период → нарезчик → {views, vids}
         periods = {}
         for r in rows:
             if len(r) < 4:
@@ -395,11 +384,11 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for period in sorted(periods.keys()):
             period_total = sum(e["views"] for e in periods[period].values())
             all_time_views += period_total
-            lines.append(f"\nИТОГО ЗА {period.upper()}: {fmt(period_total)} просмотров")
+            lines.append(f"\n📅 {period}: {fmt(period_total)} просмотров")
             for editor, d in sorted(periods[period].items(), key=lambda x: x[1]["views"], reverse=True):
                 lines.append(f"  • {editor}: {fmt(d['views'])} просм. ({d['vids']} роликов)")
 
-        lines.append(f"\nВСЕГО ЗА ВСЁ ВРЕМЯ: {fmt(all_time_views)} просмотров")
+        lines.append(f"\n📊 ВСЕГО ЗА ВСЁ ВРЕМЯ: {fmt(all_time_views)} просмотров")
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
