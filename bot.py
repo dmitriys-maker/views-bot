@@ -4,7 +4,7 @@ import asyncio
 import base64
 import httpx
 import tempfile
-from datetime import datetime
+from datetime import datetime, date
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -26,6 +26,32 @@ SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/a
 
 user_states = {}
 
+MONTHS_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+}
+
+
+def get_billing_month(dt=None):
+    """Возвращает (год, месяц) расчётного периода для даты.
+    Период: с 4-го числа текущего месяца по 3-е следующего.
+    Если день < 4 — относится к предыдущему месяцу."""
+    if dt is None:
+        dt = datetime.now()
+    if dt.day <= 4:
+        # Относится к предыдущему месяцу
+        if dt.month == 1:
+            return dt.year - 1, 12
+        else:
+            return dt.year, dt.month - 1
+    else:
+        return dt.year, dt.month
+
+
+def billing_month_label(year, month):
+    return f"{MONTHS_RU[month]} {year}"
+
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
@@ -45,29 +71,32 @@ def get_sheet():
     try:
         ws = sh.worksheet("Все записи")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet("Все записи", rows=5000, cols=8)
-        ws.append_row(["Дата", "Нарезчик", "Канал", "Telegram ID", "Платформа", "Просмотры", "Роликов на скрине", "Описание"])
-        ws.format("A1:H1", {"textFormat": {"bold": True}})
+        ws = sh.add_worksheet("Все записи", rows=5000, cols=9)
+        ws.append_row(["Дата", "Период", "Нарезчик", "Канал", "Telegram ID", "Платформа", "Просмотры", "Роликов на скрине", "Описание"])
+        ws.format("A1:I1", {"textFormat": {"bold": True}})
 
     try:
         ws_sum = sh.worksheet("Итоги")
     except gspread.WorksheetNotFound:
-        ws_sum = sh.add_worksheet("Итоги", rows=500, cols=6)
-        ws_sum.update("A1", [["Нарезчик", "Канал", "Всего просмотров", "Роликов", "Скринов", "Обновлено"]])
-        ws_sum.format("A1:F1", {"textFormat": {"bold": True}})
+        ws_sum = sh.add_worksheet("Итоги", rows=500, cols=7)
+        ws_sum.update("A1", [["Период", "Нарезчик", "Канал", "Всего просмотров", "Роликов", "Скринов", "Обновлено"]])
+        ws_sum.format("A1:G1", {"textFormat": {"bold": True}})
 
     return sh, ws, ws_sum
 
 
 def save_to_sheet(editor_name, channel, tg_id, platform, videos):
     sh, ws, ws_sum = get_sheet()
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = datetime.now()
+    now_str = now.strftime("%d.%m.%Y %H:%M")
+    year, month = get_billing_month(now)
+    period = billing_month_label(year, month)
 
     existing = ws.get_all_values()
     existing_keys = set()
     for row in existing[1:]:
-        if len(row) >= 8:
-            key = (row[1], row[2], str(row[5]), row[7].strip().lower()[:50])
+        if len(row) >= 9:
+            key = (row[2], row[3], str(row[6]), row[8].strip().lower()[:50])
             existing_keys.add(key)
 
     rows_to_add = []
@@ -78,32 +107,32 @@ def save_to_sheet(editor_name, channel, tg_id, platform, videos):
         if key in existing_keys:
             skipped.append(v)
         else:
-            rows_to_add.append([now, editor_name, channel, str(tg_id), platform, v["views"], len(videos), desc])
+            rows_to_add.append([now_str, period, editor_name, channel, str(tg_id), platform, v["views"], len(videos), desc])
             existing_keys.add(key)
 
-    total_views = sum(r[5] for r in rows_to_add)
+    total_views = sum(r[6] for r in rows_to_add)
     if rows_to_add:
         ws.append_rows(rows_to_add)
-        update_summary(ws_sum, editor_name, channel, total_views, len(rows_to_add), 1, now)
+        update_summary(ws_sum, period, editor_name, channel, total_views, len(rows_to_add), 1, now_str)
 
     return total_views, skipped
 
 
-def update_summary(ws_sum, editor_name, channel, new_views, new_vids, new_screens, now):
+def update_summary(ws_sum, period, editor_name, channel, new_views, new_vids, new_screens, now):
     data = ws_sum.get_all_values()
     rows = data[1:] if len(data) > 1 else []
-    keys = [(r[0], r[1]) for r in rows]
-    key = (editor_name, channel)
+    keys = [(r[0], r[1], r[2]) for r in rows]
+    key = (period, editor_name, channel)
 
     if key in keys:
         idx = keys.index(key)
         row_num = idx + 2
-        old_views = int(rows[idx][2]) if rows[idx][2] else 0
-        old_vids = int(rows[idx][3]) if rows[idx][3] else 0
-        old_screens = int(rows[idx][4]) if len(rows[idx]) > 4 and rows[idx][4] else 0
-        ws_sum.update(f"A{row_num}:F{row_num}", [[editor_name, channel, old_views + new_views, old_vids + new_vids, old_screens + new_screens, now]])
+        old_views = int(rows[idx][3]) if rows[idx][3] else 0
+        old_vids = int(rows[idx][4]) if rows[idx][4] else 0
+        old_screens = int(rows[idx][5]) if len(rows[idx]) > 5 and rows[idx][5] else 0
+        ws_sum.update(f"A{row_num}:G{row_num}", [[period, editor_name, channel, old_views + new_views, old_vids + new_vids, old_screens + new_screens, now]])
     else:
-        ws_sum.append_row([editor_name, channel, new_views, new_vids, new_screens, now])
+        ws_sum.append_row([period, editor_name, channel, new_views, new_vids, new_screens, now])
 
 
 # ─── Claude Vision ────────────────────────────────────────────────────────────
@@ -119,7 +148,7 @@ async def scan_image(image_bytes, mime_type="image/jpeg"):
                 "max_tokens": 1000,
                 "messages": [{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-                    {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK Видео). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}"}
+                    {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK/Instagram). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}"}
                 ]}]
             }
         )
@@ -138,12 +167,6 @@ def get_state(user_id):
 
 def fmt(n):
     return f"{n:,}".replace(",", " ")
-
-
-def plural(n):
-    if n % 10 == 1 and n % 100 != 11: return ''
-    if n % 10 in [2, 3, 4] and n % 100 not in [12, 13, 14]: return 'а'
-    return 'ов'
 
 
 # ─── Queue processor ──────────────────────────────────────────────────────────
@@ -189,15 +212,18 @@ async def process_queue(user_id, editor_name, ctx):
         await asyncio.sleep(0.5)
 
     if state["session_screens"] > 0:
+        year, month = get_billing_month()
+        period = billing_month_label(year, month)
         await ctx.bot.send_message(user_id,
             f"Готово! Итог сессии:\n"
+            f"Период: {period}\n"
             f"Канал: {state['channel']}\n"
             f"Платформа: {state['platform']}\n"
             f"Скринов: {state['session_screens']}\n"
             f"Роликов: {state['session_videos']}\n"
             f"Просмотров: {fmt(state['session_views'])}\n\n"
             f"Всё записано в таблицу\n"
-            f"Для новой сессии выбери платформу: /tiktok /youtube /vk"
+            f"Для новой сессии выбери платформу: /tiktok /youtube /vk /instagram"
         )
         state["session_views"] = 0
         state["session_videos"] = 0
@@ -215,7 +241,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "1. Выбери платформу:\n"
         "   /tiktok — TikTok\n"
         "   /youtube — YouTube\n"
-        "   /vk — VK Видео\n\n"
+        "   /vk — VK Видео\n"
+        "   /instagram — Instagram\n\n"
         "2. Введи название канала\n"
         "3. Кидай скрины — хоть 200 штук подряд\n\n"
         "Команды:\n"
@@ -238,6 +265,7 @@ async def set_platform(update, ctx, platform):
 async def set_tiktok(update, ctx): await set_platform(update, ctx, "TikTok")
 async def set_youtube(update, ctx): await set_platform(update, ctx, "YouTube")
 async def set_vk(update, ctx): await set_platform(update, ctx, "VK Видео")
+async def set_instagram(update, ctx): await set_platform(update, ctx, "Instagram")
 
 
 async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -247,9 +275,16 @@ async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["channel"] = channel
         state["platform"] = state["pending_platform"]
         state["waiting_channel"] = False
-        await update.message.reply_text(f"Канал: {channel}\nПлатформа: {state['platform']}\n\nТеперь кидай скрины!")
+        year, month = get_billing_month()
+        period = billing_month_label(year, month)
+        await update.message.reply_text(
+            f"Канал: {channel}\n"
+            f"Платформа: {state['platform']}\n"
+            f"Период: {period}\n\n"
+            f"Теперь кидай скрины!"
+        )
     else:
-        await update.message.reply_text("Выбери платформу:\n/tiktok /youtube /vk")
+        await update.message.reply_text("Выбери платформу:\n/tiktok /youtube /vk /instagram")
 
 
 async def photo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -261,7 +296,7 @@ async def photo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if not state["platform"] or not state["channel"]:
-        await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk")
+        await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk /instagram")
         return
 
     photo = update.message.photo[-1]
@@ -285,7 +320,7 @@ async def document_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала введи название канала текстом.")
         return
     if not state["platform"] or not state["channel"]:
-        await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk")
+        await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk /instagram")
         return
 
     state["queue"].append({"file_id": doc.file_id, "mime": doc.mime_type})
@@ -302,15 +337,22 @@ async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         _, _, ws_sum = get_sheet()
         data = ws_sum.get_all_values()
-        rows = [r for r in data[1:] if r[0] == editor_name]
+        rows = [r for r in data[1:] if len(r) > 1 and r[1] == editor_name]
         if rows:
-            lines = [f"Твоя статистика ({editor_name}):\n"]
-            total_views = 0
+            # Группируем по периоду
+            periods = {}
             for r in rows:
-                views = int(r[2]) if r[2] else 0
-                total_views += views
-                lines.append(f"• {r[1]}: {fmt(views)} просмотров ({r[3]} роликов)")
-            lines.append(f"\nИтого: {fmt(total_views)} просмотров")
+                period = r[0]
+                views = int(r[3]) if r[3] else 0
+                if period not in periods:
+                    periods[period] = 0
+                periods[period] += views
+
+            lines = [f"Твоя статистика ({editor_name}):\n"]
+            for period, views in sorted(periods.items()):
+                lines.append(f"• {period}: {fmt(views)} просмотров")
+            total = sum(periods.values())
+            lines.append(f"\nВсего за всё время: {fmt(total)} просмотров")
             await update.message.reply_text("\n".join(lines))
         else:
             await update.message.reply_text("У тебя пока нет записей.")
@@ -330,23 +372,34 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Данных пока нет.")
             return
 
-        editors = {}
+        # Группируем по периоду
+        periods = {}
         for r in rows:
-            name = r[0]
-            views = int(r[2]) if r[2] else 0
-            vids = int(r[3]) if r[3] else 0
-            if name not in editors:
-                editors[name] = {"views": 0, "vids": 0, "channels": []}
-            editors[name]["views"] += views
-            editors[name]["vids"] += vids
-            editors[name]["channels"].append(r[1])
+            if len(r) < 4:
+                continue
+            period = r[0]
+            editor = r[1]
+            views = int(r[3]) if r[3] else 0
+            vids = int(r[4]) if len(r) > 4 and r[4] else 0
 
-        total_views = sum(e["views"] for e in editors.values())
-        lines = ["Статистика по всем нарезчикам:\n"]
-        for name, d in sorted(editors.items(), key=lambda x: x[1]["views"], reverse=True):
-            channels = ", ".join(set(d["channels"]))
-            lines.append(f"• {name}: {fmt(d['views'])} просмотров ({d['vids']} роликов)\n  Каналы: {channels}")
-        lines.append(f"\nИТОГО: {fmt(total_views)} просмотров")
+            if period not in periods:
+                periods[period] = {}
+            if editor not in periods[period]:
+                periods[period][editor] = {"views": 0, "vids": 0}
+            periods[period][editor]["views"] += views
+            periods[period][editor]["vids"] += vids
+
+        lines = []
+        all_time_views = 0
+
+        for period in sorted(periods.keys()):
+            period_total = sum(e["views"] for e in periods[period].values())
+            all_time_views += period_total
+            lines.append(f"\nИТОГО ЗА {period.upper()}: {fmt(period_total)} просмотров")
+            for editor, d in sorted(periods[period].items(), key=lambda x: x[1]["views"], reverse=True):
+                lines.append(f"  • {editor}: {fmt(d['views'])} просм. ({d['vids']} роликов)")
+
+        lines.append(f"\nВСЕГО ЗА ВСЁ ВРЕМЯ: {fmt(all_time_views)} просмотров")
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
@@ -360,6 +413,7 @@ def main():
     app.add_handler(CommandHandler("tiktok", set_tiktok))
     app.add_handler(CommandHandler("youtube", set_youtube))
     app.add_handler(CommandHandler("vk", set_vk))
+    app.add_handler(CommandHandler("instagram", set_instagram))
     app.add_handler(CommandHandler("stats", my_stats))
     app.add_handler(CommandHandler("total", total_stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_received))
