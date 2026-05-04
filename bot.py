@@ -33,12 +33,6 @@ MONTHS_RU = {
 
 
 def get_billing_period(dt=None):
-    """
-    Определяет расчётный период по дате отправки скрина.
-    1-16 число → первая половина (период 1) текущего месяца
-    17-31 число → вторая половина (период 2) текущего месяца
-    Возвращает строку вида "Апрель 1 2026" или "Апрель 2 2026"
-    """
     if dt is None:
         dt = datetime.now()
     month_name = MONTHS_RU[dt.month]
@@ -94,15 +88,16 @@ def save_to_sheet(editor_name, channel, tg_id, platform, videos):
     rows_to_add = []
     skipped = []
     for v in videos:
-        desc = v.get("description", "")
-        key = (editor_name, channel, str(v["views"]), desc.strip().lower()[:50])
+        desc = v.get("description", "") or ""
+        views = int(v.get("views") or 0)
+        key = (editor_name, channel, str(views), desc.strip().lower()[:50])
         if key in existing_keys:
             skipped.append(v)
         else:
-            rows_to_add.append([now_str, period, editor_name, channel, str(tg_id), platform, v["views"], len(videos), desc])
+            rows_to_add.append([now_str, period, editor_name, channel, str(tg_id), platform, views, len(videos), desc])
             existing_keys.add(key)
 
-    total_views = sum(r[6] for r in rows_to_add)
+    total_views = sum(int(r[6] or 0) for r in rows_to_add)
     if rows_to_add:
         ws.append_rows(rows_to_add)
         update_summary(ws_sum, period, editor_name, channel, total_views, len(rows_to_add), 1, now_str)
@@ -119,9 +114,9 @@ def update_summary(ws_sum, period, editor_name, channel, new_views, new_vids, ne
     if key in keys:
         idx = keys.index(key)
         row_num = idx + 2
-        old_views = int(rows[idx][3]) if rows[idx][3] else 0
-        old_vids = int(rows[idx][4]) if rows[idx][4] else 0
-        old_screens = int(rows[idx][5]) if len(rows[idx]) > 5 and rows[idx][5] else 0
+        old_views = int(rows[idx][3] or 0) if rows[idx][3] else 0
+        old_vids = int(rows[idx][4] or 0) if rows[idx][4] else 0
+        old_screens = int(rows[idx][5] or 0) if len(rows[idx]) > 5 and rows[idx][5] else 0
         ws_sum.update(f"A{row_num}:G{row_num}", [[period, editor_name, channel, old_views + new_views, old_vids + new_vids, old_screens + new_screens, now]])
     else:
         ws_sum.append_row([period, editor_name, channel, new_views, new_vids, new_screens, now])
@@ -140,13 +135,20 @@ async def scan_image(image_bytes, mime_type="image/jpeg"):
                 "max_tokens": 1000,
                 "messages": [{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-                    {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK/Instagram). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}"}
+                    {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK/Instagram). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON без пояснений: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}. Число просмотров всегда должно быть целым числом, не null."}
                 ]}]
             }
         )
     data = resp.json()
     text = "".join(c.get("text", "") for c in data.get("content", [])).replace("```json", "").replace("```", "").strip()
-    return json.loads(text).get("videos", [])
+    if not text:
+        return []
+    try:
+        videos = json.loads(text).get("videos", [])
+        # Фильтруем None и нулевые просмотры
+        return [v for v in videos if v.get("views") is not None and int(v.get("views") or 0) > 0]
+    except Exception:
+        return []
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -163,7 +165,7 @@ def get_state(user_id):
 
 
 def fmt(n):
-    return f"{n:,}".replace(",", " ")
+    return f"{int(n or 0):,}".replace(",", " ")
 
 
 # ─── Queue processor ──────────────────────────────────────────────────────────
@@ -186,7 +188,7 @@ async def process_queue(user_id, editor_name, ctx):
                 continue
 
             total_views, skipped = save_to_sheet(editor_name, state["channel"], user_id, state["platform"], videos)
-            state["session_views"] += total_views
+            state["session_views"] += int(total_views or 0)
             state["session_videos"] += len(videos) - len(skipped)
             state["session_screens"] += 1
 
@@ -194,9 +196,13 @@ async def process_queue(user_id, editor_name, ctx):
             lines = [f"Скрин обработан ({state['platform']}, канал: {state['channel']})"]
             for v in videos:
                 desc = f" — {v['description']}" if v.get("description") else ""
-                is_dup = any(s["views"] == v["views"] and s.get("description", "") == v.get("description", "") for s in skipped)
+                is_dup = any(
+                    int(s.get("views") or 0) == int(v.get("views") or 0) and
+                    (s.get("description") or "") == (v.get("description") or "")
+                    for s in skipped
+                )
                 dup_mark = " (дубль, пропущен)" if is_dup else ""
-                lines.append(f"  · {fmt(v['views'])} просмотров{desc}{dup_mark}")
+                lines.append(f"  · {fmt(v.get('views', 0))} просмотров{desc}{dup_mark}")
             if skipped:
                 lines.append(f"Пропущено дублей: {len(skipped)}")
             if remaining > 0:
@@ -335,9 +341,8 @@ async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             periods = {}
             for r in rows:
                 period = r[0]
-                views = int(r[3]) if r[3] else 0
+                views = int(r[3] or 0) if r[3] else 0
                 periods[period] = periods.get(period, 0) + views
-
             lines = [f"Твоя статистика ({editor_name}):\n"]
             for period, views in sorted(periods.items()):
                 lines.append(f"• {period}: {fmt(views)} просмотров")
@@ -361,15 +366,14 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Данных пока нет.")
             return
 
-        # Группируем: период → нарезчик → {views, vids}
         periods = {}
         for r in rows:
             if len(r) < 4:
                 continue
             period = r[0]
             editor = r[1]
-            views = int(r[3]) if r[3] else 0
-            vids = int(r[4]) if len(r) > 4 and r[4] else 0
+            views = int(r[3] or 0) if r[3] else 0
+            vids = int(r[4] or 0) if len(r) > 4 and r[4] else 0
 
             if period not in periods:
                 periods[period] = {}
