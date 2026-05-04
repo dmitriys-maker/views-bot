@@ -12,79 +12,102 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
-
+ 
 load_dotenv()
-
+ 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-
+ 
 SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-
+ 
 user_states = {}
-
+ 
 MONTHS_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
     5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
     9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
 }
-
-
+ 
+# Кэш существующих записей — загружается один раз за сессию
+_existing_keys_cache = None
+_cache_loaded = False
+ 
+ 
 def get_billing_period(dt=None):
     if dt is None:
         dt = datetime.now()
     month_name = MONTHS_RU[dt.month]
     half = 1 if dt.day <= 16 else 2
     return f"{month_name} {half} {dt.year}"
-
-
+ 
+ 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
-
+ 
 def get_creds():
     if GOOGLE_CREDENTIALS_JSON:
         info = json.loads(GOOGLE_CREDENTIALS_JSON)
         return Credentials.from_service_account_info(info, scopes=SCOPES)
     else:
         return Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-
-
+ 
+ 
 def get_sheet():
     creds = get_creds()
     client = gspread.authorize(creds)
     sh = client.open_by_key(GOOGLE_SHEET_ID)
-
+ 
     try:
         ws = sh.worksheet("Все записи")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet("Все записи", rows=5000, cols=9)
         ws.append_row(["Дата", "Период", "Нарезчик", "Канал", "Telegram ID", "Платформа", "Просмотры", "Роликов на скрине", "Описание"])
         ws.format("A1:I1", {"textFormat": {"bold": True}})
-
+ 
     try:
         ws_sum = sh.worksheet("Итоги")
     except gspread.WorksheetNotFound:
         ws_sum = sh.add_worksheet("Итоги", rows=500, cols=7)
         ws_sum.update("A1", [["Период", "Нарезчик", "Канал", "Всего просмотров", "Роликов", "Скринов", "Обновлено"]])
         ws_sum.format("A1:G1", {"textFormat": {"bold": True}})
-
+ 
     return sh, ws, ws_sum
-
-
-def save_to_sheet(editor_name, channel, tg_id, platform, videos):
-    sh, ws, ws_sum = get_sheet()
-    now = datetime.now()
-    now_str = now.strftime("%d.%m.%Y %H:%M")
-    period = get_billing_period(now)
-
+ 
+ 
+def load_existing_keys(ws):
+    """Загружает все существующие ключи из таблицы в кэш."""
+    global _existing_keys_cache, _cache_loaded
+    if _cache_loaded and _existing_keys_cache is not None:
+        return _existing_keys_cache
     existing = ws.get_all_values()
-    existing_keys = set()
+    keys = set()
     for row in existing[1:]:
         if len(row) >= 9:
             key = (row[2], row[3], str(row[6]), row[8].strip().lower()[:50])
-            existing_keys.add(key)
-
+            keys.add(key)
+    _existing_keys_cache = keys
+    _cache_loaded = True
+    return keys
+ 
+ 
+def add_to_cache(editor_name, channel, views, desc):
+    """Добавляет новую запись в кэш без обращения к таблице."""
+    global _existing_keys_cache
+    if _existing_keys_cache is None:
+        _existing_keys_cache = set()
+    key = (editor_name, channel, str(views), desc.strip().lower()[:50])
+    _existing_keys_cache.add(key)
+ 
+ 
+def save_to_sheet(editor_name, channel, tg_id, platform, videos, ws, ws_sum):
+    now = datetime.now()
+    now_str = now.strftime("%d.%m.%Y %H:%M")
+    period = get_billing_period(now)
+ 
+    existing_keys = load_existing_keys(ws)
+ 
     rows_to_add = []
     skipped = []
     for v in videos:
@@ -95,22 +118,22 @@ def save_to_sheet(editor_name, channel, tg_id, platform, videos):
             skipped.append(v)
         else:
             rows_to_add.append([now_str, period, editor_name, channel, str(tg_id), platform, views, len(videos), desc])
-            existing_keys.add(key)
-
+            add_to_cache(editor_name, channel, views, desc)
+ 
     total_views = sum(int(r[6] or 0) for r in rows_to_add)
     if rows_to_add:
         ws.append_rows(rows_to_add)
         update_summary(ws_sum, period, editor_name, channel, total_views, len(rows_to_add), 1, now_str)
-
+ 
     return total_views, skipped
-
-
+ 
+ 
 def update_summary(ws_sum, period, editor_name, channel, new_views, new_vids, new_screens, now):
     data = ws_sum.get_all_values()
     rows = data[1:] if len(data) > 1 else []
     keys = [(r[0], r[1], r[2]) for r in rows]
     key = (period, editor_name, channel)
-
+ 
     if key in keys:
         idx = keys.index(key)
         row_num = idx + 2
@@ -120,10 +143,10 @@ def update_summary(ws_sum, period, editor_name, channel, new_views, new_vids, ne
         ws_sum.update(f"A{row_num}:G{row_num}", [[period, editor_name, channel, old_views + new_views, old_vids + new_vids, old_screens + new_screens, now]])
     else:
         ws_sum.append_row([period, editor_name, channel, new_views, new_vids, new_screens, now])
-
-
+ 
+ 
 # ─── Claude Vision ────────────────────────────────────────────────────────────
-
+ 
 async def scan_image(image_bytes, mime_type="image/jpeg"):
     b64 = base64.b64encode(image_bytes).decode()
     async with httpx.AsyncClient(timeout=60) as client:
@@ -145,14 +168,13 @@ async def scan_image(image_bytes, mime_type="image/jpeg"):
         return []
     try:
         videos = json.loads(text).get("videos", [])
-        # Фильтруем None и нулевые просмотры
         return [v for v in videos if v.get("views") is not None and int(v.get("views") or 0) > 0]
     except Exception:
         return []
-
-
+ 
+ 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
+ 
 def get_state(user_id):
     if user_id not in user_states:
         user_states[user_id] = {
@@ -162,36 +184,45 @@ def get_state(user_id):
             "session_views": 0, "session_videos": 0, "session_screens": 0
         }
     return user_states[user_id]
-
-
+ 
+ 
 def fmt(n):
     return f"{int(n or 0):,}".replace(",", " ")
-
-
+ 
+ 
 # ─── Queue processor ──────────────────────────────────────────────────────────
-
+ 
 async def process_queue(user_id, editor_name, ctx):
     state = get_state(user_id)
     if state["processing"]:
         return
     state["processing"] = True
-
+ 
+    # Открываем таблицу один раз для всей очереди
+    try:
+        sh, ws, ws_sum = get_sheet()
+    except Exception as e:
+        await ctx.bot.send_message(user_id, f"Ошибка подключения к таблице: {e}")
+        state["processing"] = False
+        return
+ 
     while state["queue"]:
         item = state["queue"].pop(0)
         try:
             tg_file = await ctx.bot.get_file(item["file_id"])
             image_bytes = await tg_file.download_as_bytearray()
             videos = await scan_image(bytes(image_bytes), item["mime"])
-
+ 
             if not videos:
                 await ctx.bot.send_message(user_id, "Один скрин пропущен — не нашёл просмотры.")
+                await asyncio.sleep(1)
                 continue
-
-            total_views, skipped = save_to_sheet(editor_name, state["channel"], user_id, state["platform"], videos)
+ 
+            total_views, skipped = save_to_sheet(editor_name, state["channel"], user_id, state["platform"], videos, ws, ws_sum)
             state["session_views"] += int(total_views or 0)
             state["session_videos"] += len(videos) - len(skipped)
             state["session_screens"] += 1
-
+ 
             remaining = len(state["queue"])
             lines = [f"Скрин обработан ({state['platform']}, канал: {state['channel']})"]
             for v in videos:
@@ -208,12 +239,13 @@ async def process_queue(user_id, editor_name, ctx):
             if remaining > 0:
                 lines.append(f"Осталось: {remaining} скринов")
             await ctx.bot.send_message(user_id, "\n".join(lines))
-
+ 
         except Exception as e:
-            await ctx.bot.send_message(user_id, f"Ошибка: {e}")
-
-        await asyncio.sleep(0.5)
-
+            await ctx.bot.send_message(user_id, f"Ошибка при обработке скрина: {e}")
+ 
+        # Пауза между скринами чтобы не превышать лимиты Google
+        await asyncio.sleep(2)
+ 
     if state["session_screens"] > 0:
         period = get_billing_period()
         await ctx.bot.send_message(user_id,
@@ -230,12 +262,12 @@ async def process_queue(user_id, editor_name, ctx):
         state["session_views"] = 0
         state["session_videos"] = 0
         state["session_screens"] = 0
-
+ 
     state["processing"] = False
-
-
+ 
+ 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
-
+ 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я считаю просмотры со скринов статистики.\n\n"
@@ -251,8 +283,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/stats — моя статистика\n"
         "/total — общая статистика (админ)"
     )
-
-
+ 
+ 
 async def set_platform(update, ctx, platform):
     state = get_state(update.effective_user.id)
     state["pending_platform"] = platform
@@ -262,14 +294,14 @@ async def set_platform(update, ctx, platform):
     state["session_videos"] = 0
     state["session_screens"] = 0
     await update.message.reply_text(f"Платформа: {platform}\n\nВведи название канала:")
-
-
+ 
+ 
 async def set_tiktok(update, ctx): await set_platform(update, ctx, "TikTok")
 async def set_youtube(update, ctx): await set_platform(update, ctx, "YouTube")
 async def set_vk(update, ctx): await set_platform(update, ctx, "VK Видео")
 async def set_instagram(update, ctx): await set_platform(update, ctx, "Instagram")
-
-
+ 
+ 
 async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = get_state(update.effective_user.id)
     if state["waiting_channel"]:
@@ -286,34 +318,34 @@ async def text_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Выбери платформу:\n/tiktok /youtube /vk /instagram")
-
-
+ 
+ 
 async def photo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     state = get_state(user.id)
-
+ 
     if state["waiting_channel"]:
         await update.message.reply_text("Сначала введи название канала текстом.")
         return
     if not state["platform"] or not state["channel"]:
         await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk /instagram")
         return
-
+ 
     photo = update.message.photo[-1]
     state["queue"].append({"file_id": photo.file_id, "mime": "image/jpeg"})
     if len(state["queue"]) == 1 and not state["processing"]:
         await update.message.reply_text(f"Получил! Платформа: {state['platform']}, канал: {state['channel']}\nКидай остальные скрины!")
-
+ 
     editor_name = user.username or user.first_name or str(user.id)
     asyncio.create_task(process_queue(user.id, editor_name, ctx))
-
-
+ 
+ 
 async def document_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     doc = update.message.document
     if not doc.mime_type or not doc.mime_type.startswith("image/"):
         return
-
+ 
     state = get_state(user.id)
     if state["waiting_channel"]:
         await update.message.reply_text("Сначала введи название канала текстом.")
@@ -321,15 +353,15 @@ async def document_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state["platform"] or not state["channel"]:
         await update.message.reply_text("Сначала выбери платформу:\n/tiktok /youtube /vk /instagram")
         return
-
+ 
     state["queue"].append({"file_id": doc.file_id, "mime": doc.mime_type})
     if len(state["queue"]) == 1 and not state["processing"]:
         await update.message.reply_text(f"Получил! Платформа: {state['platform']}, канал: {state['channel']}\nКидай остальные скрины!")
-
+ 
     editor_name = user.username or user.first_name or str(user.id)
     asyncio.create_task(process_queue(user.id, editor_name, ctx))
-
-
+ 
+ 
 async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     editor_name = user.username or user.first_name or str(user.id)
@@ -352,8 +384,8 @@ async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("У тебя пока нет записей.")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
-
-
+ 
+ 
 async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Эта команда только для администратора.")
@@ -365,7 +397,7 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("Данных пока нет.")
             return
-
+ 
         periods = {}
         for r in rows:
             if len(r) < 4:
@@ -374,32 +406,32 @@ async def total_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             editor = r[1]
             views = int(r[3] or 0) if r[3] else 0
             vids = int(r[4] or 0) if len(r) > 4 and r[4] else 0
-
+ 
             if period not in periods:
                 periods[period] = {}
             if editor not in periods[period]:
                 periods[period][editor] = {"views": 0, "vids": 0}
             periods[period][editor]["views"] += views
             periods[period][editor]["vids"] += vids
-
+ 
         lines = []
         all_time_views = 0
-
+ 
         for period in sorted(periods.keys()):
             period_total = sum(e["views"] for e in periods[period].values())
             all_time_views += period_total
             lines.append(f"\n📅 {period}: {fmt(period_total)} просмотров")
             for editor, d in sorted(periods[period].items(), key=lambda x: x[1]["views"], reverse=True):
                 lines.append(f"  • {editor}: {fmt(d['views'])} просм. ({d['vids']} роликов)")
-
+ 
         lines.append(f"\n📊 ВСЕГО ЗА ВСЁ ВРЕМЯ: {fmt(all_time_views)} просмотров")
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
-
-
+ 
+ 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-
+ 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -414,7 +446,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.IMAGE, document_received))
     print("Бот запущен...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
