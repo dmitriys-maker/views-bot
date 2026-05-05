@@ -31,7 +31,6 @@ MONTHS_RU = {
     9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
 }
  
-# Кэш существующих записей — загружается один раз за сессию
 _existing_keys_cache = None
 _cache_loaded = False
  
@@ -77,7 +76,6 @@ def get_sheet():
  
  
 def load_existing_keys(ws):
-    """Загружает все существующие ключи из таблицы в кэш."""
     global _existing_keys_cache, _cache_loaded
     if _cache_loaded and _existing_keys_cache is not None:
         return _existing_keys_cache
@@ -93,7 +91,6 @@ def load_existing_keys(ws):
  
  
 def add_to_cache(editor_name, channel, views, desc):
-    """Добавляет новую запись в кэш без обращения к таблице."""
     global _existing_keys_cache
     if _existing_keys_cache is None:
         _existing_keys_cache = set()
@@ -149,28 +146,36 @@ def update_summary(ws_sum, period, editor_name, channel, new_views, new_vids, ne
  
 async def scan_image(image_bytes, mime_type="image/jpeg"):
     b64 = base64.b64encode(image_bytes).decode()
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": "claude-opus-4-5",
-                "max_tokens": 1000,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-                    {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK/Instagram). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON без пояснений: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}. Число просмотров всегда должно быть целым числом, не null."}
-                ]}]
-            }
-        )
-    data = resp.json()
-    text = "".join(c.get("text", "") for c in data.get("content", [])).replace("```json", "").replace("```", "").strip()
-    if not text:
-        return []
-    try:
-        videos = json.loads(text).get("videos", [])
-        return [v for v in videos if v.get("views") is not None and int(v.get("views") or 0) > 0]
-    except Exception:
-        return []
+    
+    for attempt in range(3):  # 3 попытки
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={
+                        "model": "claude-opus-4-5",
+                        "max_tokens": 1000,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                            {"type": "text", "text": "На скрине статистика видео (TikTok/YouTube/VK/Instagram). Найди ВСЕ числа просмотров для КАЖДОГО видео. Просмотры: 'просмотры', 'views', иконка глаза. Конвертируй: 1.2K=1200, 1.5M=1500000, 2.3млн=2300000. Ответь ТОЛЬКО JSON без пояснений: {\"videos\":[{\"views\":число,\"description\":\"название\"}]}. Число просмотров всегда должно быть целым числом, не null."}
+                        ]}]
+                    }
+                )
+            data = resp.json()
+            text = "".join(c.get("text", "") for c in data.get("content", [])).replace("```json", "").replace("```", "").strip()
+            if not text:
+                return []
+            videos = json.loads(text).get("videos", [])
+            return [v for v in videos if v.get("views") is not None and int(v.get("views") or 0) > 0]
+        except (httpx.TimeoutException, httpx.ReadTimeout):
+            if attempt < 2:
+                await asyncio.sleep(3)
+                continue
+            return []
+        except Exception:
+            return []
+    return []
  
  
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -198,7 +203,6 @@ async def process_queue(user_id, editor_name, ctx):
         return
     state["processing"] = True
  
-    # Открываем таблицу один раз для всей очереди
     try:
         sh, ws, ws_sum = get_sheet()
     except Exception as e:
@@ -214,7 +218,7 @@ async def process_queue(user_id, editor_name, ctx):
             videos = await scan_image(bytes(image_bytes), item["mime"])
  
             if not videos:
-                await ctx.bot.send_message(user_id, "Один скрин пропущен — не нашёл просмотры.")
+                await ctx.bot.send_message(user_id, "Один скрин пропущен — не нашёл просмотры. Попробуй отправить его снова.")
                 await asyncio.sleep(1)
                 continue
  
@@ -243,7 +247,6 @@ async def process_queue(user_id, editor_name, ctx):
         except Exception as e:
             await ctx.bot.send_message(user_id, f"Ошибка при обработке скрина: {e}")
  
-        # Пауза между скринами чтобы не превышать лимиты Google
         await asyncio.sleep(2)
  
     if state["session_screens"] > 0:
